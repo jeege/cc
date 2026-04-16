@@ -1,0 +1,98 @@
+# .github/workflows/docker-build.yml
+name: Build and Push Docker Image
+
+on:
+  push:
+    branches: [ main ]
+    tags: [ 'v*' ]
+  workflow_dispatch:
+  schedule:
+    - cron: '0 8 * * *'
+
+permissions:
+  contents: write
+  packages: write
+  attestations: write
+  id-token: write
+
+jobs:
+  check-upstream:
+    runs-on: ubuntu-latest
+    outputs:
+      should_build: ${{ steps.check.outputs.should_build }}
+      cc_switch_version: ${{ steps.check.outputs.cc_switch_version }}
+      claude_code_version: ${{ steps.check.outputs.claude_code_version }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Check upstream releases
+        id: check
+        run: |
+          CC_SWITCH_LATEST=$(curl -s https://api.github.com/repos/SaladDay/cc-switch-cli/releases/latest | jq -r '.tag_name // empty')
+          CLAUDE_CODE_LATEST=$(curl -s https://registry.npmjs.org/@anthropic-ai/claude-code/latest | jq -r '.version // empty')
+          
+          echo "cc_switch_version=${CC_SWITCH_LATEST}" >> $GITHUB_OUTPUT
+          echo "claude_code_version=${CLAUDE_CODE_LATEST}" >> $GITHUB_OUTPUT
+          
+          LAST_CC_SWITCH=$(grep cc-switch .upstream-versions 2>/dev/null | cut -d= -f2 || echo "")
+          LAST_CLAUDE_CODE=$(grep claude-code .upstream-versions 2>/dev/null | cut -d= -f2 || echo "")
+          
+          if [[ "${{ github.event_name }}" != "schedule" ]]; then
+            echo "should_build=true" >> $GITHUB_OUTPUT
+          elif [[ "$CC_SWITCH_LATEST" != "$LAST_CC_SWITCH" ]] || [[ "$CLAUDE_CODE_LATEST" != "$LAST_CLAUDE_CODE" ]]; then
+            echo "should_build=true" >> $GITHUB_OUTPUT
+          else
+            echo "should_build=false" >> $GITHUB_OUTPUT
+          fi
+
+  build-and-push:
+    needs: check-upstream
+    if: needs.check-upstream.outputs.should_build == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/${{ github.repository }}
+          tags: |
+            type=ref,event=branch
+            type=ref,event=pr
+            type=semver,pattern={{version}}
+            type=sha
+            type=raw,value=latest,enable={{is_default_branch}}
+
+      - name: Build and push
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Update upstream versions
+        if: github.event_name == 'schedule'
+        run: |
+          echo "cc-switch=${{ needs.check-upstream.outputs.cc_switch_version }}" > .upstream-versions
+          echo "claude-code=${{ needs.check-upstream.outputs.claude_code_version }}" >> .upstream-versions
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add .upstream-versions
+          git diff --staged --quiet || git commit -m "chore: update upstream versions"
+          git push
